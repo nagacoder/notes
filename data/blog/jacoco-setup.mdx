@@ -1,0 +1,353 @@
+---
+title: Jacoco Setup
+date: "2026-02-15T22:12:03.284Z"
+tags: ["tech"]
+summary: "Karate + JaCoCo Coverage for Spring Boot SOAP Services"
+---
+
+# Karate + JaCoCo Coverage for Spring Boot SOAP Services
+
+## Overview
+
+Karate tests run against a **live Spring Boot server** (separate JVM), so standard unit-test JaCoCo won't capture coverage. The solution: attach the JaCoCo agent to the server JVM in **TCP server mode**, run Karate tests, then dump coverage over TCP before stopping the app.
+
+## Architecture
+
+```
+┌──────────────────────────────────┐     ┌──────────────────────────────┐
+│  Failsafe JVM (test runner)      │     │  Spring Boot JVM (app)       │
+│                                  │     │                              │
+│  KarateIT.java                   │     │  Your SOAP endpoints         │
+│    └── *.feature files           │────▶│  + JaCoCo agent attached     │
+│        (HTTP/SOAP requests)      │     │    (listening on port 6300)  │
+│                                  │     │                              │
+└──────────────────────────────────┘     └──────────────┬───────────────┘
+                                                        │
+                                         jacoco:dump connects to port 6300
+                                                        │
+                                                        ▼
+                                              target/jacoco-it.exec
+                                                        │
+                                              jacoco:report-integration
+                                                        │
+                                                        ▼
+                                          target/site/jacoco-it/index.html
+```
+
+---
+
+## Prerequisites
+
+- Java 17+
+- Maven 3.6+
+- Spring Boot 3.x project with SOAP web services
+
+---
+
+## Step 1: Add Dependencies
+
+Add these to your `pom.xml` `<dependencies>` section:
+
+```xml
+<!-- Actuator: required for spring-boot-maven-plugin start/stop goals -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+
+<!-- Karate for functional testing -->
+<dependency>
+    <groupId>com.intuit.karate</groupId>
+    <artifactId>karate-junit5</artifactId>
+    <version>1.4.1</version>
+    <scope>test</scope>
+</dependency>
+```
+
+> **Why Actuator?** The `spring-boot-maven-plugin`'s `start`/`stop` goals use Actuator's management endpoint to detect when the app is ready and to trigger graceful shutdown.
+
+---
+
+## Step 2: Create the Test Runner as `*IT.java`
+
+Maven convention:
+- `*Test.java` → picked up by **Surefire** (unit tests, `mvn test`)
+- `*IT.java` → picked up by **Failsafe** (integration tests, `mvn verify`)
+
+Create `src/test/java/karate/KarateIT.java`:
+
+```java
+package karate;
+
+import com.intuit.karate.junit5.Karate;
+
+public class KarateIT {
+
+    @Karate.Test
+    Karate testAll() {
+        return Karate.run().relativeTo(getClass());
+    }
+}
+```
+
+> **Important:** Do NOT keep a `KarateTest.java` — otherwise `mvn test` tries to run Karate without a server and fails.
+
+---
+
+## Step 3: Configure Test Resources
+
+Karate `.feature` files live alongside Java files. Tell Maven to include them:
+
+```xml
+<build>
+    <testResources>
+        <testResource>
+            <directory>src/test/java</directory>
+            <includes>
+                <include>**/*.feature</include>
+                <include>**/*.js</include>
+            </includes>
+        </testResource>
+        <testResource>
+            <directory>src/test/resources</directory>
+        </testResource>
+    </testResources>
+</build>
+```
+
+---
+
+## Step 4: Configure Plugins
+
+Add a version property:
+
+```xml
+<properties>
+    <jacoco.version>0.8.12</jacoco.version>
+</properties>
+```
+
+### Plugin Order Matters
+
+Plugins in the **same Maven phase** execute in the order they appear in the POM. The correct order is:
+
+| #  | Plugin                       | Why this order                                    |
+|----|------------------------------|---------------------------------------------------|
+| 1  | `maven-dependency-plugin`    | Copies JaCoCo agent jar before anything else       |
+| 2  | `jacoco-maven-plugin`        | Dump must happen while app is still running        |
+| 3  | `spring-boot-maven-plugin`   | Start before tests, stop after JaCoCo dump         |
+| 4  | `maven-surefire-plugin`      | Exclude `*IT.java` from unit tests                 |
+| 5  | `maven-failsafe-plugin`      | Run `*IT.java` during integration-test phase       |
+
+### 4a. Copy JaCoCo Agent Jar
+
+```xml
+<plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-dependency-plugin</artifactId>
+    <executions>
+        <execution>
+            <id>copy-jacoco-agent</id>
+            <phase>initialize</phase>
+            <goals><goal>copy</goal></goals>
+            <configuration>
+                <artifactItems>
+                    <artifactItem>
+                        <groupId>org.jacoco</groupId>
+                        <artifactId>org.jacoco.agent</artifactId>
+                        <version>${jacoco.version}</version>
+                        <classifier>runtime</classifier>
+                        <outputDirectory>${project.build.directory}/agents</outputDirectory>
+                        <destFileName>jacocoagent.jar</destFileName>
+                    </artifactItem>
+                </artifactItems>
+            </configuration>
+        </execution>
+    </executions>
+</plugin>
+```
+
+> **Why copy the jar?** We need a known, fixed path to the agent jar for the `-javaagent` argument. This avoids relying on Maven property resolution which can fail when passing JVM args to the Spring Boot plugin.
+
+### 4b. JaCoCo — Dump + Report
+
+```xml
+<plugin>
+    <groupId>org.jacoco</groupId>
+    <artifactId>jacoco-maven-plugin</artifactId>
+    <version>${jacoco.version}</version>
+    <executions>
+        <!-- Pull coverage data over TCP from the running app -->
+        <execution>
+            <id>dump-coverage</id>
+            <phase>post-integration-test</phase>
+            <goals><goal>dump</goal></goals>
+            <configuration>
+                <address>localhost</address>
+                <port>6300</port>
+                <destFile>${project.build.directory}/jacoco-it.exec</destFile>
+                <reset>false</reset>
+            </configuration>
+        </execution>
+        <!-- Generate HTML/XML/CSV report -->
+        <execution>
+            <id>report-integration</id>
+            <phase>verify</phase>
+            <goals><goal>report-integration</goal></goals>
+            <configuration>
+                <dataFile>${project.build.directory}/jacoco-it.exec</dataFile>
+                <outputDirectory>${project.reporting.outputDirectory}/jacoco-it</outputDirectory>
+            </configuration>
+        </execution>
+    </executions>
+</plugin>
+```
+
+### 4c. Spring Boot — Start/Stop
+
+```xml
+<plugin>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-maven-plugin</artifactId>
+    <executions>
+        <execution>
+            <id>pre-integration-test</id>
+            <goals><goal>start</goal></goals>
+            <configuration>
+                <jvmArguments>
+                    -javaagent:${project.build.directory}/agents/jacocoagent.jar=output=tcpserver,address=localhost,port=6300
+                </jvmArguments>
+                <maxAttempts>60</maxAttempts>
+                <wait>1000</wait>
+            </configuration>
+        </execution>
+        <execution>
+            <id>post-integration-test</id>
+            <goals><goal>stop</goal></goals>
+        </execution>
+    </executions>
+</plugin>
+```
+
+> **Key:** The `-javaagent` string uses `output=tcpserver` so JaCoCo listens on port 6300. The `dump` goal then pulls data from this port. This is more reliable than `output=file` which depends on JVM shutdown hooks.
+
+### 4d. Surefire — Exclude IT Tests
+
+```xml
+<plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-surefire-plugin</artifactId>
+    <configuration>
+        <excludes>
+            <exclude>**/*IT.java</exclude>
+        </excludes>
+    </configuration>
+</plugin>
+```
+
+### 4e. Failsafe — Run IT Tests
+
+```xml
+<plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-failsafe-plugin</artifactId>
+    <executions>
+        <execution>
+            <goals>
+                <goal>integration-test</goal>
+                <goal>verify</goal>
+            </goals>
+            <configuration>
+                <includes>
+                    <include>**/*IT.java</include>
+                </includes>
+            </configuration>
+        </execution>
+    </executions>
+</plugin>
+```
+
+---
+
+## Step 5: Run
+
+```bash
+mvn verify
+```
+
+This single command does everything.
+
+---
+
+## Lifecycle Execution Order
+
+| Phase                    | What Runs                                          |
+|--------------------------|----------------------------------------------------|
+| `initialize`             | Copy `jacocoagent.jar` → `target/agents/`          |
+| `compile`                | Compile application code                           |
+| `test`                   | Surefire runs unit tests (skips `*IT.java`)        |
+| `package`                | Build the jar                                      |
+| `pre-integration-test`   | Spring Boot starts with JaCoCo agent (TCP mode)    |
+| `integration-test`       | Failsafe runs `KarateIT.java` against live server  |
+| `post-integration-test`  | JaCoCo dumps coverage over TCP (port 6300)         |
+| `post-integration-test`  | Spring Boot stops the app                          |
+| `verify`                 | JaCoCo generates HTML/XML/CSV report               |
+
+---
+
+## Step 6: View the Report
+
+```bash
+open target/site/jacoco-it/index.html
+```
+
+### Output Files
+
+| File                               | Description                    |
+|------------------------------------|--------------------------------|
+| `target/jacoco-it.exec`           | Raw coverage data (binary)     |
+| `target/site/jacoco-it/index.html`| HTML report (open in browser)  |
+| `target/site/jacoco-it/jacoco.xml`| XML report (for CI tools)      |
+| `target/site/jacoco-it/jacoco.csv`| CSV report (for spreadsheets)  |
+
+---
+
+## Troubleshooting
+
+### `Failed to connect to MBean server at port 9001`
+- **Cause:** Actuator dependency is missing.
+- **Fix:** Add `spring-boot-starter-actuator` dependency.
+
+### `Skipping JaCoCo execution due to missing execution data file`
+- **Cause:** JaCoCo agent was not attached to the Spring Boot JVM, so no `.exec` file was created.
+- **Fix:** Ensure you are using the `maven-dependency-plugin` approach to copy the agent jar, and the `-javaagent:` path in `<jvmArguments>` is correct.
+
+### `Connection refused` on port 6300 during `jacoco:dump`
+- **Cause:** The app didn't start, or the JaCoCo agent wasn't attached with `output=tcpserver`.
+- **Fix:** Check the Spring Boot startup logs for errors. Verify the `-javaagent` argument is present in the process.
+
+### Port 6300 already in use
+- **Cause:** Another process (or a previous run) is using port 6300.
+- **Fix:** Change the port in both the `-javaagent` string and the `<port>` in `jacoco:dump` config.
+
+### Tests pass but coverage is 0%
+- **Cause:** Karate tests are hitting a different server (wrong base URL).
+- **Fix:** Ensure your `.feature` files use `http://localhost:8080` (or whatever port your app runs on).
+
+---
+
+## Why Not Use `prepare-agent-integration` + `${argLine}`?
+
+The standard JaCoCo approach (`prepare-agent-integration` sets a `${argLine}` property) works for Surefire/Failsafe because those plugins natively support `argLine`. However, `spring-boot-maven-plugin`'s `<jvmArguments>` does **not** reliably resolve Maven properties set by other plugins at runtime. The `maven-dependency-plugin` + hardcoded `-javaagent` approach bypasses this issue entirely.
+
+---
+
+## No Code Changes Required
+
+The JaCoCo agent instruments bytecode at the JVM level. You do **not** need to:
+- Modify your `main()` class
+- Add any annotations
+- Add any Spring configuration
+- Change your SOAP endpoint code
+
+Everything is handled through Maven plugin configuration.
