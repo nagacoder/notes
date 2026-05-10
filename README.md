@@ -24,9 +24,6 @@ Check out the documentation below to get started.
 
 If you're on windows you'll first need to run the following command in PowerShell:
 
-```bash
- $env:PWD = Get-Location
-```
 
 First, run the development server:
 
